@@ -78,3 +78,91 @@ key:value(field,value)
 *   zrangebyscore key min max: 按照score排序后，获取指定score范围内的元素
 *   zdiff、zinter、zunion: 求差集、交集、并集
 **注意**:所有排名默认升序，降序则在在z后添加rev
+# Spring Data Redis
+## 1. 概述
+- **Spring Data Redis** 是 Spring 家族中用于操作 Redis 的模块。
+- 它封装了底层通信细节，提供统一、便捷的 API。
+- 核心组件：`RedisTemplate`，用于执行各种 Redis 命令。
+
+---
+
+## 2. RedisTemplate 核心功能
+- 提供 **类型安全** 的操作方法，按数据结构分类：
+  - `opsForValue()` —— 字符串（String）
+  - `opsForHash()` —— 哈希（Hash）
+  - `opsForList()` —— 列表（List）
+  - `opsForSet()` —— 集合（Set）
+  - `opsForZSet()` —— 有序集合（ZSet）
+
+---
+
+## 3. 使用步骤
+
+### 3.1 添加依赖
+```
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+### 3.2 配置文件
+```
+spring:
+  redis:
+    host: 192.168.150.101 # Redis服务器IP
+    port: 6379            # 端口
+    password: 123321      # 密码
+    lettuce:              # 客户端类型 (Spring Boot 2.x 默认 Lettuce)
+      pool:
+        max-active: 8     # 最大活跃连接数
+        max-idle: 8       # 最大空闲连接数
+        min-idle: 0       # 最小空闲连接数
+        max-wait: 100ms   # 获取连接最大等待时间
+```
+### 3.3 注入RedisTemplate并使用
+```
+@Autowired
+private RedisTemplate<String, Object> redisTemplate;
+
+// 存值
+redisTemplate.opsForValue().set("key", "value");
+
+// 取值
+Object value = redisTemplate.opsForValue().get("key");
+```
+## 4. 序列化问题
+默认使用 JDK 序列化（JdkSerializationRedisSerializer），数据可读性差，且占用空间大。
+· 推荐：自定义序列化方案，例如使用 StringRedisSerializer 或 Jackson2JsonRedisSerializer。
+
+自定义配置示例
+
+```
+@Configuration
+public class RedisConfig {
+
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+
+        // 设置 key 的序列化器
+        template.setKeySerializer(new StringRedisSerializer());
+        // 设置 value 的序列化器
+        template.setValueSerializer(new Jackson2JsonRedisSerializer<>(Object.class));
+        // 设置 hash 的序列化器
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(new Jackson2JsonRedisSerializer<>(Object.class));
+
+        template.afterPropertiesSet();
+        return template;
+    }
+}
+```
+## 5.StringRedisTemplate 与 RedisTemplate 的区别
+| 特性                 | `RedisTemplate<K, V>`                  | `StringRedisTemplate`                     |
+| -------------------- | -------------------------------------- | ----------------------------------------- |
+| **继承关系**         | 父类                                   | 子类                                      |
+| **泛型**             | `K` 和 `V` 可为任意类型                | 固定为 `String`                           |
+| **默认序列化器**     | `JdkSerializationRedisSerializer`      | `StringRedisSerializer`                   |
+| **数据兼容性**       | 存储二进制数据，与 `StringRedisTemplate` 不互通 | 存储字符串，可读性高，与其他客户端兼容性好 |
+| **使用场景**         | 存储复杂对象（需自定义序列化）         | 存储纯字符串、缓存文本等                  |
