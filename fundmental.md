@@ -167,73 +167,468 @@ public class RedisConfig {
 | **数据兼容性**       | 存储二进制数据，与 `StringRedisTemplate` 不互通 | 存储字符串，可读性高，与其他客户端兼容性好 |
 | **使用场景**         | 存储复杂对象（需自定义序列化）         | 存储纯字符串、缓存文本等                  |
 
-# 什么是缓存
-缓存就是数据交换的缓冲区，是存贮数据的临时地方，读写性能较高
-## 作用
-- 降低后端负载
-- 提高读写效率，降低响应时间
-## 成本
-- 数据一致性成本
-- 代码维护成本
-- 运维成本
-# 缓存更新
-## 总体原则
-
-*   低一致性需求： 对数据实时性要求不高，直接使用 Redis 自带的内存淘汰机制即可。
-*   高一致性需求： 需要主动更新缓存，并以“超时剔除”（设置过期时间）作为兜底方案，防止缓存中存在长期不更新的脏数据。
-
-## 高一致性需求下的具体操作步骤
-
-针对高一致性需求，具体的读、写操作流程如下：
-
-*   读操作 (Read Operation):
-    *   缓存命中： 直接从缓存中获取并返回数据。
-    *   缓存未命中： 先去查询数据库，拿到数据后写入缓存，并设定一个超时时间，然后返回数据。
-
-*   写操作 (Write Operation):
-    *   执行顺序： 先写数据库，然后再删除缓存。
-    *   关键要求： 必须确保数据库与缓存操作的原子性，即这两个操作要么都成功，要么都失败（通常通过事务或消息队列等机制来保证），以防止出现数据不一致的情况。
-
-# 缓存穿透
-**缓存穿透**是指客户端请求的数据在缓存和数据库中不存在
-## 解决方案
-### 缓存空对象
-优点:实现简单,维护方便
-
-缺点:
-- 额外的内存消耗
-- 可能造成短期的不一致
-### 布隆过滤
-优点: 内存占用少，没有多余key
-
-缺点:
-   - 实现复杂
-   - 存在误判
-
-# 缓存雪崩
-缓存雪崩是指在同一时段大量的缓存key同时失效或者Redis服务宕机，导致大量请求到达数据库,带来巨大压力
-## 解决方案
-- 给不同的key的TTL添加随机值
-- 利用Redis集群提高服务的可用性
-- 给缓存业务添加降级限流策略
-- 给业务添加多级缓存
-# 缓存击穿
-缓存击穿问题也叫热点Key问题,就是一个高并发访问并且缓存重建业务较复杂的Key突然消失了，无数的请求访问会在瞬间给数据库带来巨大的冲击
-## 解决方案
-### 互斥锁
-优点:
-    - 没有额外的内存消耗
-    - 保证一致性
-    - 实现简单
-缺点:
-    - 线程需要等待,性能收到影响
-    - 有死锁的风险
 
 
-### 逻辑过期
-优点: 线程无需等待，性能较好
-缺点: 
-    - 不保证一致性
-    - 有额外内存消耗
-    - 实现复杂
+# 一、 缓存架构基础认知
 
+## 1.1 什么是缓存 (Cache)？
+*   定义：数据交换的缓冲区，利用内存的高速读写特性，作为磁盘（数据库）与应用程序之间的高效中间层。
+*   常见层级：CPU L1/L2 缓存 rightarrow 浏览器/客户端缓存 rightarrow 业务代码内存缓存 (Caffeine) rightarrow 分布式缓存 (Redis)。
+
+## 1.2 引入缓存的核心价值与代价
+*   收益 (收益 > 成本时引入)：
+    *   降低后端负载：拦截绝大多数读请求，保护数据库不被高并发击穿。
+    *   提升系统性能：毫秒级响应，大幅降低用户感知延迟。
+*   引入成本 (Trade-off)：
+    *   数据一致性成本：双写（DB + Cache）必然带来短暂或长期的不一致风险。
+    *   代码维护成本
+    *   运维成本
+
+# 二、 缓存更新策略
+## 1.三种更新策略
+
+- 内存淘汰：Redis自动触发（达到max-memory时）
+- 超时剔除：设置TTL后自动删除过期数据
+- 主动更新：手动删除缓存，解决缓存与数据库不一致问题
+
+## 2.旁路缓存策略
+### 2.1 读操作流程
+1.  查缓存：命中则直接返回数据；未命中则向下查询数据库。
+2.  查库回填：从数据库查询到数据后，将其写入缓存，并设置合理的过期时间 (TTL)。
+3.  返回数据：将数据返回给业务方。
+
+### 2.2 写操作流程（重点：为何是先更新DB，再删除缓存？）
+*   标准流程：先修改数据库 rightarrow 修改成功后再删除对应的缓存。
+*   为什么不先删缓存？（延迟双删）
+    *   若先删缓存，再更新 DB，在更新 DB 的这段极短时间窗口内，若有并发读请求，会查询到旧 DB 数据并重新写入缓存，导致脏数据常驻缓存。
+*   为什么不更新缓存？
+    *   缓存更新需要计算（如反序列化 rightarrow 修改属性 rightarrow 序列化 rightarrow 写回），性能开销大。
+    *   并发写时，多线程同时更新缓存，极易导致数据错乱。
+    *   直接删除缓存，让下一次读请求重新从 DB 加载，既安全又解耦。
+```
+@Service
+public class CacheAsideService {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    @Autowired
+    private OrderMapper orderMapper; // 模拟业务 Mapper
+
+    // 1. 读操作：先读缓存，未命中查库回填
+    public Order getOrderById(Long id) {
+        String cacheKey = "order:info:" + id;
+        // 查缓存
+        String json = redisTemplate.opsForValue().get(cacheKey);
+        if (json != null) {
+            return JSONUtil.toBean(json, Order.class);
+        }
+
+        // 查数据库
+        Order order = orderMapper.selectById(id);
+        if (order != null) {
+            // 回填缓存并设置随机TTL，防止缓存雪崩
+            int randomTime = 300 + ThreadLocalRandom.current().nextInt(60); 
+            redisTemplate.opsForValue().set(cacheKey, JSONUtil.toJsonStr(order), randomTime, TimeUnit.SECONDS);
+        }
+        return order;
+    }
+
+    // 2. 写操作：先更新数据库，再删除缓存
+    public void updateOrder(Order order) {
+        // 更新数据库
+        orderMapper.updateById(order);
+        // 删除缓存（下次读取时自动加载最新数据）
+        String cacheKey = "order:info:" + order.getId();
+        redisTemplate.delete(cacheKey);
+    }
+}
+```
+# 三、 缓存三大核心问题与解决方案
+
+引入缓存后，必须面对以下三个经典的分布式问题，并制定兜底方案。
+
+## 3.1 缓存穿透 (Cache Penetration)
+*   现象：客户端恶意请求一个在缓存和数据库中都不存在的 Key（如 id=-1）。导致所有请求全部穿透到数据库，缓存失去保护屏障。
+*   解决方案：
+    1.  缓存空对象（通用轻量方案）：
+        *   查库为空时，将 Key 的值设为 null 并缓存一个极短的 TTL（如 3-5 分钟）。
+        *   缺点：消耗少量额外内存，且在 TTL 内存在短暂的“数据库更新后，缓存还是空”的不一致期。
+    2.  布隆过滤器 (Bloom Filter)：
+        *   在缓存前增加一层布隆过滤器，将海量合法 Key 映射到 Hash 集合中。请求进来时先过布隆过滤器，命中不了则直接拦截。
+        *   缺点：存在极小概率的误判（即实际不存在的数据被误判为存在），且不支持 Key 的删除操作。
+```
+    @Service
+    public class PenetrationService {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    // 声明一个全局布隆过滤器
+    private BloomFilter<CharSequence> bloomFilter;
+
+    @PostConstruct
+    public void init() {
+        // 初始化布隆过滤器（预期插入100万数据，误判率0.01）
+        bloomFilter = BloomFilter.create(Funnels.stringFunnel(StandardCharsets.UTF_8), 1000000, 0.01);
+        // TODO: 在系统启动或数据变更时，将所有合法的ID加入布隆过滤器
+    }
+
+    public Order safeGetOrder(Long id) {
+        String cacheKey = "order:info:" + id;
+        
+        // 1. 布隆过滤器拦截（判断一定不存在的数据直接返回）
+        if (bloomFilter != null && !bloomFilter.mightContain(id.toString())) {
+            return null;
+        }
+
+        // 2. 查缓存
+        String json = redisTemplate.opsForValue().get(cacheKey);
+        if (json != null) {
+            // 区分空对象标识（如 "NULL"）和真实数据
+            return "NULL".equals(json) ? null : JSONUtil.toBean(json, Order.class);
+        }
+
+        // 3. 查数据库
+        Order order = orderMapper.selectById(id);
+        if (order != null) {
+            // 存入真实数据
+            redisTemplate.opsForValue().set(cacheKey, JSONUtil.toJsonStr(order), 30, TimeUnit.MINUTES);
+        } else {
+            // 4. 防穿透核心：缓存空对象（设置较短的TTL）
+            redisTemplate.opsForValue().set(cacheKey, "NULL", 2, TimeUnit.MINUTES);
+        }
+        return order;
+    }
+
+```
+
+## 3.2 缓存雪崩 (Cache Avalanche)
+*   现象：大量缓存 Key 在同一时刻集体失效，或者 Redis 集群宕机，导致海量请求瞬间直达数据库，引发数据库崩溃。
+*   解决方案：
+    1.  TTL 随机化：在设置过期时间时，给基础 TTL 加上一个随机值（如 base_ttl + random(1~60s)），避免 Key 集中过期。
+    2.  多级缓存架构：引入 Caffeine 本地缓存作为第一道防线，减少 Redis 穿透压力。
+    3.  高可用与降级：采用 Redis Sentinel 或 Cluster 集群；对非核心业务添加限流、熔断降级策略。
+
+## 3.3 缓存击穿 (Cache Breakdown)
+*   现象：某个极高并发访问的热点 Key（如热点商品、秒杀活动）突然过期，瞬间所有并发请求同时去查库重建缓存，打爆数据库。
+*   解决方案：
+  
+### 1.  互斥锁 (Mutex Lock)：
+
+*   未命中缓存时，只有一个线程获取到分布式锁（如 setnx）去查库并重建缓存；其他线程休眠重试或自旋等待。
+*   优缺点：数据强一致，但并发性能较低，且有死锁风险（需设置锁超时时间）。
+         
+```
+    @Service
+    public class CacheMutexService {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private ProductMapper productMapper;
+
+    public Product getShopWithMutex(Long id) {
+        String cacheKey = "shop:info:" + id;
+        String lockKey = "lock:shop:" + id;
+
+        // 1. 查询缓存
+        String json = redisTemplate.opsForValue().get(cacheKey);
+        if (json != null) {
+            return JSONUtil.toBean(json, Product.class);
+        }
+
+        // 2. 尝试获取互斥锁 (setnx + 超时时间，防止死锁)
+        Boolean isLock = redisTemplate.opsForValue()
+                .setIfAbsent(lockKey, "1", 10, TimeUnit.MINUTES);
+
+        // 3. 锁获取失败，线程休眠后递归重试（或自旋等待）
+        if (isLock == null || !isLock) {
+            try {
+                Thread.sleep(50); // 短暂休眠，减少CPU消耗
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            return getShopWithMutex(id); // 重新去查缓存
+        }
+
+        // 4. 获取锁成功，双重检查缓存（防止重复查库）
+        json = redisTemplate.opsForValue().get(cacheKey);
+        if (json != null) {
+            // 释放锁并返回数据
+            redisTemplate.delete(lockKey);
+            return JSONUtil.toBean(json, Product.class);
+        }
+
+        // 5. 查数据库并重建缓存
+        try {
+            Product product = productMapper.selectById(id);
+            if (product != null) {
+                // 写入缓存，设置基础过期时间+随机偏移（防雪崩）
+                String dataJson = JSONUtil.toJsonStr(product);
+                redisTemplate.opsForValue().set(cacheKey, dataJson, 30, TimeUnit.MINUTES);
+            }
+            return product;
+        } finally {
+            // 6. 必须释放锁
+            redisTemplate.delete(lockKey);
+        }
+    }
+}
+```
+### 2.  逻辑过期 (Logical Expire)：
+
+*   数据在 Redis 中不设物理 TTL（永不过期），但在 Value 内部封装一个 expireTime 字段作为逻辑过期时间。
+*   查询时发现逻辑过期，由其中一个线程获取互斥锁，提交到异步线程池去后台重建缓存；其他线程直接返回旧数据。
+*   优缺点：并发性能极高，不阻塞用户请求，但会短暂返回旧数据（最终一致性）。
+         
+#### 1. 封装带逻辑过期时间的数据结构
+```
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Data
+public class RedisData {
+    private Object data; // 实际数据
+    private LocalDateTime expireTime; // 逻辑过期时间
+}
+```
+#### 2. 写入逻辑过期缓存的通用方法（通常由定时任务或后台异步触发）
+```
+@Service
+public class CacheLogicalExpireService {
+
+    // 初始化异步线程池
+    private final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    public void saveWithLogicalExpire(Long id, Long expireTimeSeconds) {
+        RedisData redisData = new RedisData();
+        // 模拟查库获取数据
+        Product product = productMapper.selectById(id); 
+        redisData.setData(product);
+        // 设置逻辑过期时间（当前时间 + 指定过期时长）
+        redisData.setExpireTime(LocalDateTime.now().plusSeconds(expireTimeSeconds));
+
+        // 写入缓存（不设置TTL，即永不过期）
+        redisTemplate.opsForValue()
+                .set("shop:info:" + id, JSONUtil.toJsonStr(redisData));
+    }
+}
+```
+
+#### 3. 读取逻辑过期缓存的通用模版
+```
+    public Product getShopWithLogicalExpire(Long id) {
+        String cacheKey = "shop:info:" + id;
+        String lockKey = "lock:shop:" + id;
+
+        // 1. 查询缓存
+        String json = redisTemplate.opsForValue().get(cacheKey);
+        if (json == null) {
+            return null; // 第一次调用或缓存被清空，直接返回null
+        }
+
+        // 2. 反序列化为带逻辑时间的对象
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        Product product = (Product) redisData.getData();
+        LocalDateTime expireTime = redisData.getExpireTime();
+
+        // 3. 判断逻辑过期时间是否到期
+        if (expireTime.isAfter(LocalDateTime.now())) {
+            // 未过期，直接返回旧数据
+            return product;
+        }
+
+        // 4. 已过期，尝试获取互斥锁
+        Boolean isLock = redisTemplate.opsForValue()
+                .setIfAbsent(lockKey, "1", 10, TimeUnit.MINUTES);
+
+        // 5. 获取锁成功 -> 开启独立线程异步重建缓存
+        if (isLock != null && isLock) {
+            CACHE_REBUILD_EXECUTOR.submit(() -> {
+                try {
+                    this.saveWithLogicalExpire(id, 1800L); // 重新写入缓存，逻辑过期30分钟
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    redisTemplate.delete(lockKey); // 释放锁
+                }
+            });
+        }
+
+        // 6. 无论是否抢到锁，都直接返回当前的旧数据
+        return product;
+    }
+```
+| 缓存问题 | 核心特征 | 推荐解决方案 | 适用场景 |
+| :---- | :--- | :--- | :--- |
+| **穿透** | 请求不存在的数据 | 缓存空对象 / 布隆过滤器 | 恶意攻击多、不存在的Key较多时 |
+| **雪崩** | 大量Key同时过期 | TTL加随机值 / 高可用集群 | 系统基础防护，必须做 |
+| **击穿** | 单个热点Key过期 | 互斥锁 / 逻辑过期 | 互斥锁适合数据一致性要求高的场景；逻辑过期适合高并发、允许短暂旧数据的热点场景 |
+# 缓存工具的封装
+```
+@Component
+public class RedisCache {
+    private StringRedisTemplate stringRedisTemplate;
+    // 引入线程池，用于处理逻辑过期中的异步缓存重建
+    private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+
+    public RedisCache(StringRedisTemplate stringRedisTemplate) {
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+    /**
+     * 设置缓存（支持 TTL 随机化，防止缓存雪崩）
+     */
+    public void set(String key, Object value, Long time, TimeUnit unit) {
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(value), time, unit);
+    }
+
+    public void set(String key, Object value, Long time, TimeUnit unit, boolean isRandomTTL) {
+        if (isRandomTTL) {
+            // 增加 0~20% 的随机时间
+            long max = time * 12 / 10;
+            long randomTime = ThreadLocalRandom.current().nextLong(time, max);
+            set(key, value, randomTime, unit);
+        } else {
+            set(key, value, time, unit);
+        }
+    }
+
+    /**
+     * 方案一：解决缓存击穿 -> 互斥锁策略
+     * @param key 缓存 Key
+     * @param valueClass 反序列化的目标类型
+     * @param dbFallback 缓存未命中时，去数据库查询的回调逻辑
+     * @param time 缓存过期时间
+     * @param unit 时间单位
+     */
+    public <R, ID> R queryWithMutex(String key, ID id, Class<R> valueClass, 
+                                     Function<ID, R> dbFallback, Long time, TimeUnit unit) {
+        // 1. 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (json != null) {
+            return JSONUtil.toBean(json, valueClass);
+        }
+        // 如果命中缓存空对象，直接返回 null
+        if (json != null && !"".equals(json)) {
+            return null; 
+        }
+
+        // 2. 获取互斥锁
+        String lockKey = "lock:" + key;
+        R result = null;
+        try {
+            boolean isLock = tryLock(lockKey);
+            if (!isLock) {
+                // 3. 获取锁失败，休眠重试
+                Thread.sleep(50);
+                return queryWithMutex(key, id, valueClass, dbFallback, time, unit);
+            }
+            // 4. 获取锁成功，查询数据库
+            result = dbFallback.apply(id);
+            // 5. 数据库查不到，写入空对象并设置短 TTL 防止穿透
+            if (result == null) {
+                stringRedisTemplate.opsForValue().set(key, "", 2, TimeUnit.MINUTES);
+                return null;
+            }
+            // 6. 查询成功，写入 Redis (带随机TTL防雪崩)
+            this.set(key, result, time, unit, true);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            // 7. 释放锁
+            unlock(lockKey);
+        }
+        return result;
+    }
+
+    /**
+     * 方案二：解决缓存击穿 -> 逻辑过期策略
+     * @param idFunc 用于从实体类中提取 ID 的方法
+     */
+    public <R, ID> R queryWithLogicalExpire(String key, ID id, Class<R> valueClass, 
+                                             Function<ID, R> dbFallback, 
+                                             Function<R, ID> idFunc, Long time, TimeUnit unit) {
+        // 1. 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (json == null) {
+            return null;
+        }
+
+        // 2. 命中，反序列化（使用 RedisData 包装类）
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        JSONObject data = (JSONObject) redisData.getData();
+        R r = JSONUtil.toBean(data, valueClass);
+        LocalDateTime expireTime = redisData.getExpireTime();
+
+        // 3. 判断是否过期
+        if (expireTime.isAfter(LocalDateTime.now())) {
+            // 未过期，直接返回
+            return r;
+        }
+
+        // 4. 已过期，尝试获取互斥锁
+        String lockKey = "lock:" + key;
+        boolean isLock = tryLock(lockKey);
+        if (isLock) {
+            // 5. 获取锁成功，开启独立线程异步重建缓存
+            CACHE_REBUILD_EXECUTOR.submit(() -> {
+                try {
+                    // 5.1 查数据库
+                    R dbResult = dbFallback.apply(id);
+                    // 5.2 写入 Redis（设置逻辑过期时间）
+                    this.setWithLogicalExpire(key, dbResult, time, unit);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    unlock(lockKey);
+                }
+            });
+        }
+        // 6. 无论是否抢到锁，都直接返回当前的旧数据
+        return r;
+    }
+
+    /**
+     * 写入逻辑过期数据（物理上不设 TTL，在 Value 内封装 expireTime）
+     */
+    private <R> void setWithLogicalExpire(String key, R value, Long time, TimeUnit unit) {
+        RedisData redisData = new RedisData();
+        redisData.setData(JSONUtil.toJsonStr(value));
+        redisData.setExpireTime(LocalDateTime.now().plusSeconds(unit.toSeconds(time)));
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
+    }
+
+    // --- 互斥锁基础操作 ---
+    private boolean tryLock(String key) {
+        Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.MINUTES);
+        return Boolean.TRUE.equals(flag);
+    }
+
+    private void unlock(String key) {
+        stringRedisTemplate.delete(key);
+    }
+}
+```
+## 逻辑过期实体类
+```
+@Data
+public class RedisData {
+    // 逻辑过期时间
+    private LocalDateTime expireTime;
+    // 实际缓存的业务数据
+    private Object data;
+}
+```
+# 全局ID生成器
+全局ID生成器,是一种在分布式系统下用来生成唯一ID的工具,一般满足下列特性:
+- 唯一性
+- 高可用性
+- 高性能
+- 递增性
+- 安全性
