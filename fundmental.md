@@ -705,3 +705,100 @@ do {
 
 return var5;
 ```
+# 分布式锁-Redisson
+## 入门
+### 1.引入依赖
+```
+<dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson-spring-boot-starter</artifactId>
+            <version>3.42.0</version>
+</dependency>
+```
+### 2.配置Redisson
+```
+@Configuration
+public class RedissonConfig {
+
+    @Bean
+    public RedissonClient redissonClient(){
+        // 配置
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://192.168.150.101:6379")
+            .setPassword("123321");
+        // 创建RedissonClient对象
+        return Redisson.create(config);
+    }
+}
+```
+### 3.使用Redisson
+```
+@Resource
+private RedissionClient redissonClient;
+
+@Test
+void testRedisson() throws Exception{
+    //获取锁(可重入)，指定锁的名称
+    RLock lock = redissonClient.getLock("anyLock");
+    //尝试获取锁，参数分别是：获取锁的最大等待时间(期间会重试)，锁自动释放时间，时间单位
+    boolean isLock = lock.tryLock(1,10,TimeUnit.SECONDS);
+    //判断获取锁成功
+    if(isLock){
+        try{
+            System.out.println("执行业务");          
+        }finally{
+            //释放锁
+            lock.unlock();
+        }   
+    }  
+}
+```
+## 可重入锁原理
+可重入锁就是为了防止“同一个线程，在持有锁的情况下，因为内部调用还需要这把锁，从而导致自己被卡死”的情况。
+### 1. Redis 的数据结构：Hash（哈希表）
+
+在单机 JUC 锁中， state  变量存在 JVM 内存里；但在分布式锁中，这个状态存在 Redis 里。Redisson 采用的是 Hash 结构：
+
+大 Key (KEYS[1])：就是你给锁起的名字（例如  my_lock ）。它的存在与否，决定了这把锁当前有没有人持有。
+
+小 Key (ARGV[2])：格式为  客户端UUID + ":" + 线程ID （例如  88888888-xxxx-1 ）。它唯一标识了是哪台机器、哪个线程加了这把锁。
+
+Value：一个整数，代表重入的次数。
+
+
+### 2. Lua 脚本的三段式逻辑解析
+
+这段脚本在 Redis 内部是原子执行的，它包含了加锁、重入、拒锁三个完整逻辑：
+
+**KEYS[1] ： 锁名称**
+
+**ARGV[1]：  锁失效时间**
+
+**ARGV[2]：  id + ":" + threadId; 锁的小key**
+
+
+🟢 场景一：锁不存在（成功加锁）
+```
+if (redis.call('exists', KEYS[1]) == 0) then 
+    redis.call('hset', KEYS[1], ARGV[2], 1);      // 创建Hash，重入次数设为1
+    redis.call('pexpire', KEYS[1], ARGV[1]);       // 设置全局过期时间（防止死锁）
+    return nil;                                    // 返回null，表示加锁成功
+end;
+```
+如果 Redis 里根本没有这个大 Key，说明锁是空的，直接加锁成功。
+
+🔵 场景二：锁已存在，且是同一个线程重入（重入成功）
+```
+if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then 
+    redis.call('hincrby', KEYS[1], ARGV[2], 1);    // 重入次数 +1
+    redis.call('pexpire', KEYS[1], ARGV[1]);       // 重新刷新过期时间（看门狗机制的延伸）
+    return nil;                                    // 返回null，表示重入成功
+end;
+```
+如果锁被占用了，但占用者的小 Key 和当前线程完全一致，说明是自己人，允许重入，并把计数器 +1。
+
+🔴 场景三：锁已存在，且不是当前线程（加锁失败）
+```
+return redis.call('pttl', KEYS[1]); // 返回锁的剩余过期时间（毫秒）
+```
+如果以上两个条件都不满足，说明这把锁被别人占着。Redisson 框架层接收到这个非空的返回值（剩余时间）后，就会在 Java 端发起  while(true)  自旋或阻塞等待，直到对方释放锁。
