@@ -632,3 +632,162 @@ return redis.call('pttl', KEYS[1]); // 返回锁的剩余过期时间（毫秒�
 ```
 如果以上两个条件都不满足，说明这把锁被别人占着。Redisson 框架层接收到这个非空的返回值（剩余时间）后，就会在 Java 端发起  while(true)  自旋或阻塞等待，直到对方释放锁。
 
+## 锁重试和WatchDog
+### lock() 方法抢锁流程
+
+抢锁过程中，获得当前线程，通过 `tryAcquire` 进行抢锁，该抢锁逻辑和之前逻辑相同：
+
+1. **先判断当前这把锁是否存在**，如果不存在，插入一把锁，返回 null
+2. **判断当前这把锁是否属于当前线程**，如果是，则返回 null
+
+所以如果返回是 null，则代表着当前线程已经抢锁完毕，或者可重入完毕。但是如果以上两个条件都不满足，则进入到第三个条件，返回的是锁的失效时间。同学们可以自行往下翻一点点，你能发现有个 `while(true)` 再次进行 `tryAcquire` 进行抢锁。
+
+```java
+long threadId = Thread.currentThread().getId();
+Long ttl = tryAcquire(-1, leaseTime, unit, threadId);
+// lock acquired
+if (ttl == null) {
+    return;
+}
+```
+
+### 带参数与不带参数的分支逻辑
+
+接下来会有一个条件分支，因为 lock 方法有重载方法，一个是带参数，一个是不带参数：
+
+- 如果带参数传入的值是 `-1`
+- 如果传入参数，则 `leaseTime` 是他本身
+
+所以如果传入了参数，此时 `leaseTime != -1` 则会进去抢锁，抢锁的逻辑就是之前说的那三个逻辑：
+
+```java
+if (leaseTime != -1) {
+    return tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
+}
+```
+
+### 默认看门狗时间的抢锁逻辑
+
+如果是没有传入时间，则此时也会进行抢锁，而且抢锁时间是默认看门狗时间：
+
+```
+RFuture<Long> ttlRemainingFuture = tryLockInnerAsync(waitTime,
+                                        commandExecutor.getConnectionManager().getCfg().getLockWatchdogTimeout(),
+                                        TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
+```
+
+`ttlRemainingFuture.onComplete((ttlRemaining, e)` 这句话相当于对以上抢锁进行了监听，也就是说当上面抢锁完毕后，此方法会被调用，具体调用的逻辑就是去后台开启一个线程，进行续约逻辑，也就是**看门狗线程**。
+
+```
+ttlRemainingFuture.onComplete((ttlRemaining, e) -> {
+    if (e != null) {
+        return;
+    }
+
+    // lock acquired
+    if (ttlRemaining == null) {
+        scheduleExpirationRenewal(threadId);
+    }
+});
+return ttlRemainingFuture;
+```
+
+### WatchDog 续约机制详解
+
+此逻辑就是续约逻辑，注意看 `commandExecutor.getConnectionManager().newTimeout()` 此方法：
+
+**`new Timeout(Method(new TimerTask() {}), 参数2, 参数3)`**
+
+指的是：通过参数2、参数3 去描述什么时候去做参数1的事情。现在的情况是：**10s 之后去做参数1的事情**。
+
+因为锁的失效时间是 30s，当 10s 之后，此时这个 `TimerTask` 就触发了，他就去进行续约，把当前这把锁续约成 30s。如果操作成功，那么此时就会递归调用自己，再重新设置一个 `TimerTask`，于是再过 10s 后又再设置一个 `TimerTask`，完成不停的续约。
+
+### 宕机场景分析
+
+那么大家可以想一想，假设我们的线程出现了宕机他还会续约吗？
+
+**当然不会**，因为没有人再去调用 `renewExpiration` 这个方法，所以等到时间之后自然就释放了。
+
+### 续约核心源码
+
+```
+private void renewExpiration() {
+    ExpirationEntry ee = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+    if (ee == null) {
+        return;
+    }
+    
+    Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
+        @Override
+        public void run(Timeout timeout) throws Exception {
+            ExpirationEntry ent = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+            if (ent == null) {
+                return;
+            }
+            Long threadId = ent.getFirstThreadId();
+            if (threadId == null) {
+                return;
+            }
+            
+            RFuture<Boolean> future = renewExpirationAsync(threadId);
+            future.onComplete((res, e) -> {
+                if (e != null) {
+                    log.error("Can't update lock " + getName() + " expiration", e);
+                    return;
+                }
+                
+                if (res) {
+                    // reschedule itself
+                    renewExpiration();
+                }
+            });
+        }
+    }, internalLockLeaseTime / 3, TimeUnit.MILLISECONDS);
+    
+    ee.setTimeout(task);
+}
+```
+
+### 机制总结
+
+| 环节 | 说明 |
+|------|------|
+| 抢锁 | 通过 tryAcquire 判断锁是否存在、是否属于当前线程 |
+| 返回 null | 表示抢锁成功或可重入成功 |
+| 返回 ttl | 表示锁已存在且不属于当前线程，需等待重试 |
+| 看门狗超时 | 默认 30s（可配置），每 10s 续约一次（1/3 时间） |
+| 续约逻辑 | 递归调用 newTimeout 设置新的 TimerTask，实现持续续约 |
+| 宕机释放 | 线程宕机后无法调用续约方法，锁到期后自动释放 |
+
+## Multilog原理
+Redisson 中的 MultiLock（联锁/联合锁），其核心原理可以概括为：原子性地批量加锁与反向回滚。
+
+它的本质是将多个独立的锁（可以来自于不同的 Redis 实例）“打包”成一把大锁，对这把大锁进行统一的申请和释放。
+
+以下是它的底层运作机制：
+
+
+### 1. 加锁机制（全部成功才算成功）
+
+当一个线程尝试获取 MultiLock 时，底层会执行以下流程：
+
+统一排序：首先将所有需要加锁的 Key 按照固定的顺序（如字典序）进行排序，这能从物理上避免不同业务代码因加锁顺序不同而导致的交叉死锁。
+
+循环加锁：客户端会依次向这些锁发送加锁请求（底层调用 Lua 脚本）。
+
+全部获取：只有当集合中的所有锁都成功获取时，整个 MultiLock 才算加锁成功。 只要其中任何一把锁加锁失败（比如被别人占着），本次申请就宣告失败。
+
+
+### 2. 失败回滚机制（防止锁残留与单边占用）
+
+这是 MultiLock 最精妙的地方，解决了“部分成功”带来的灾难：
+
+反向释放：如果在依次加锁的过程中，假设前 3 把锁成功了，第 4 把失败了，MultiLock 不会就此作罢。
+
+原子性保障：它会立刻反向依次释放已经成功获取的前 3 把锁。
+这样保证了系统不会出现“只占了部分资源”的尴尬局面，其他等待的线程不会因为某把锁被永久占用而死循环。
+
+
+### 3. 解锁机制
+
+当业务逻辑执行完毕，需要释放 MultiLock 时，同样不需要手动一把一把去解。只需调用一次  unlock() ，底层会依次遍历所有的锁并原子性地将其全部释放。
