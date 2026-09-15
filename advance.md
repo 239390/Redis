@@ -972,11 +972,11 @@ redis-cli --cluster del-node <集群中任意节点IP:端口> <从节点ID>
 
 三种 failover 模式：
 
-默认模式： 完整流程，包含 offset 一致性校验
+* 默认模式： 完整流程，包含 offset 一致性校验
 
-force： 省略 offset 一致性校验
+* force： 省略 offset 一致性校验
 
-takeover： 直接执行第 5 步，忽略数据一致性和 master 状态
+* takeover： 直接执行第 5 步，忽略数据一致性和 master 状态
 
 ### Redis Template访问分片集群
 1.  引入redis的starter依赖
