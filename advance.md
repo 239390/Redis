@@ -861,8 +861,8 @@ appendfsync no
 | 数据恢复优先级 | 低，因为数据完整性不如AOF | 高，因为数据完整性更高 |
 | 系统资源占用 | 高，大量CPU和内存消耗 | 低，主要是磁盘IO资源<br>但AOF重写时会占用大量CPU和内存资源 |
 | 使用场景 | 可以容忍数分钟的数据丢失，追求更快的启动速度 | 对数据安全性要求较高常见 |
-# Redis哨兵
-## 哨兵的作用
+## Redis哨兵
+### 哨兵的作用
 
 - 监控：Sentinel 会不断检查您的master和slave是否按预期工作
 - 自动故障恢复：如果master故障，Sentinel会将一个slave提升为master。当故障实例恢复后也以新的master为主
@@ -885,9 +885,9 @@ Sentinel基于心跳机制检测服务状态，每隔1秒向集群的每个实�
 * sentinel给备选的slave1节点发送slaveof no one命令，让该节点成为master
 * sentinel给所有其它slave发送slaveof 192.168.150.101 7002 命令，让这些slave成为新master的从节点，开始从新的master上同步数据。
 * 最后，sentinel将故障节点标记为slave，当故障节点恢复后会自动成为新的master的slave节点
-## Redis Template的哨兵模式
+### Redis Template的哨兵模式
 
-### 1. 引入依赖 (pom.xml)
+#### 1. 引入依赖 (pom.xml)
 
 ```xml
 <dependency>
@@ -896,7 +896,7 @@ Sentinel基于心跳机制检测服务状态，每隔1秒向集群的每个实�
 </dependency>
 ```
 
-### 2. 配置哨兵信息 (application.yml)
+#### 2. 配置哨兵信息 (application.yml)
 
 ```yaml
 spring:
@@ -909,7 +909,7 @@ spring:
         - 192.168.150.101:27003
 ```
 
-### 3. 配置主从读写分离
+#### 3. 配置主从读写分离
 
 ```java
 @Bean
@@ -927,4 +927,74 @@ ReadFrom是配置Redis的读取策略是一个枚举，说明：
 · REPLICA：从slave（replica）节点读取
 
 · REPLICA_PREFERRED：优先从slave（replica）节点读取，所有的slave都不可用才读取master
+
+## 分片集群
+### 分片集群架构
+* 集群中有多个 master，每个 master 保存不同数据
+
+* 每个 master 可有多个 slave 节点
+
+* master 之间通过 ping 监测彼此健康状态
+
+* 客户端请求可访问任意节点，最终被转发到正确节点
+### 散列插槽
+Redis 将数据映射到 0~16383 共 16384 个插槽上：
+
+Key 计算插槽规则：
+
+ - key 中包含  {}  且至少包含 1 个字符 →  {}  中的部分是有效部分
+
+ - key 中不包含  {}  → 整个 key 都是有效部分
+
+ - 使用 CRC16 算法计算 hash 值，然后对 16384 取余
+
+**Redis如何判断某个key应该在哪个实例?**
+- 将16384个插槽分配到不同的实例
+- 根据key的有效值部分计算哈希值,对16384取余
+- 余数作为插槽，寻找插槽所在实例
+### 集群伸缩
+1.添加新节点到集群
+```
+redis-cli --cluster add-node <新节点IP:端口> <集群中任意已有节点IP:端口>
+```
+2. 删除从节点
+```
+redis-cli --cluster del-node <集群中任意节点IP:端口> <从节点ID>
+```
+### 故障转移
+自动故障转移流程：
+
+- master 宕机，与其他实例失去连接
+
+- 疑似宕机（其他节点检测到）
+
+- 确定下线，自动提升一个 slave 为新 master
+
+三种 failover 模式：
+
+默认模式： 完整流程，包含 offset 一致性校验
+
+force： 省略 offset 一致性校验
+
+takeover： 直接执行第 5 步，忽略数据一致性和 master 状态
+
+### Redis Template访问分片集群
+1.  引入redis的starter依赖
+
+2.  配置分片集群地址
+   
+3.  配置读写分离
+
+与哨兵模式相比，其中只有分片集群的配置方式略有差异，如下：
+```
+spring:
+  redis:
+    cluster:
+      nodes: # 指定分片集群的每一个节点信息
+        - 192.168.150.101:7001
+        - 192.168.150.101:7002
+        - 192.168.150.101:7003
+        - 192.168.150.101:8001
+        - 192.168.150.101:8002
+        - 192.168.150.101:8003
 ```
