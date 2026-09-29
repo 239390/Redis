@@ -98,7 +98,32 @@ key:value(field,value)
   - `opsForList()` —— 列表（List）
   - `opsForSet()` —— 集合（Set）
   - `opsForZSet()` —— 有序集合（ZSet）
+## 3.标准配置类
+```
+@Configuration
+public class RedisConfig {
 
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // 1. Key 采用 String 的序列化方式
+        StringRedisSerializer stringSerializer = new StringRedisSerializer();
+        template.setKeySerializer(stringSerializer);
+        template.setHashKeySerializer(stringSerializer);
+
+        // 2. Value 采用 JSON 的序列化方式 (使用 Jackson)
+        GenericJackson2JsonRedisSerializer jsonSerializer = new GenericJackson2JsonRedisSerializer();
+        template.setValueSerializer(jsonSerializer);
+        template.setHashValueSerializer(jsonSerializer);
+
+        // 3. 初始化设置
+        template.afterPropertiesSet();
+        return template;
+    }
+}
+```
 ---
 
 ## 3. 使用步骤
