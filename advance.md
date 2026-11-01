@@ -535,6 +535,92 @@ do {
 return var5;
 ```
 # 分布式锁-Redisson
+## 特性
+可见性：多个线程都能看到相同的结果，注意：这个地方说的可见性并不是并发编程中指的内存可见性，只是说多个进程之间都能感知到变化的意思
+
+互斥：互斥是分布式锁的最基本的条件，使得程序串行执行
+
+高可用：程序不易崩溃，时时刻刻都保证较高的可用性
+
+高性能：由于加锁本身就让性能降低，所有对于分布式锁本身需要他就较高的加锁性能和释放锁性能
+
+安全性：安全也是程序中必不可少的一环
+
+## 实现分布式锁时需要实现的两个基本方法：
+
+* 获取锁：
+
+  * 互斥：确保只能有一个线程获取锁
+  * 非阻塞：尝试一次，成功返回true，失败返回false
+
+* 释放锁：
+
+  * 手动释放
+  * 超时释放：获取锁时添加一个超时时间
+## 解决Redis分布式锁误删问题
+
+需求：修改之前的分布式锁实现，满足：在获取锁时存入线程标示（可以用UUID表示）
+
+在释放锁时先获取锁中的线程标示，判断是否与当前线程标示一致
+
+* 如果一致则释放锁
+* 如果不一致则不释放锁
+
+核心逻辑：在存入锁时，放入自己线程的标识，在删除锁时，判断当前这把锁的标识是不是自己存入的，如果是，则进行删除，如果不是，则不进行删除。
+
+具体代码如下：
+
+**加锁**
+```java
+private static final String ID_PREFIX = UUID.randomUUID().toString(true) + "-";
+@Override
+public boolean tryLock(long timeoutSec) {
+   // 获取线程标示
+   String threadId = ID_PREFIX + Thread.currentThread().getId();
+   // 获取锁
+   Boolean success = stringRedisTemplate.opsForValue()
+                .setIfAbsent(KEY_PREFIX + name, threadId, timeoutSec, TimeUnit.SECONDS);
+   return Boolean.TRUE.equals(success);
+}
+```
+
+**释放锁**
+```java
+public void unlock() {
+    // 获取线程标示
+    String threadId = ID_PREFIX + Thread.currentThread().getId();
+    // 获取锁中的标示
+    String id = stringRedisTemplate.opsForValue().get(KEY_PREFIX + name);
+    // 判断标示是否一致
+    if(threadId.equals(id)) {
+        // 释放锁
+        stringRedisTemplate.delete(KEY_PREFIX + name);
+    }
+}
+```
+## Lua脚本
+在一个脚本中编写多条Redis命令，确保多条命令执行时的原子性
+```lua
+redis.call('命令名称', 'key', '其它参数', ...)
+```
+
+例如，我们要执行set name jack，则脚本是这样：
+
+```lua
+# 执行 set name jack
+redis.call('set', 'name', 'jack')
+```
+
+例如，我们要先执行set name Rose，再执行get name，则脚本如下：
+
+```lua
+# 先执行 set name jack
+redis.call('set', 'name', 'Rose')
+# 再执行 get name
+local name = redis.call('get', 'name')
+# 返回
+return name
+```
 ## 入门
 ### 1.引入依赖
 ```
@@ -583,12 +669,12 @@ void testRedisson() throws Exception{
 }
 ```
 ## 可重入锁原理
-可重入锁就是为了防止“同一个线程，在持有锁的情况下，因为内部调用还需要这把锁，从而导致自己被卡死”的情况。
+可重入锁就是为了防止“同一个线程，在持有锁的情况下，因为内部调用还需要这把锁，防止同一个线程/同一个客户端在已持有锁时再次请求同一把锁，导致自死锁；不同线程/不同客户端不能重入。”的情况。
 ### 1. Redis 的数据结构：Hash（哈希表）
 
 在单机 JUC 锁中， state  变量存在 JVM 内存里；但在分布式锁中，这个状态存在 Redis 里。Redisson 采用的是 Hash 结构：
 
-大 Key (KEYS[1])：就是你给锁起的名字（例如  my_lock ）。它的存在与否，决定了这把锁当前有没有人持有。
+大 Key (KEYS[1])：就是你给锁起的名字（例如  my_lock ）。Hash 中存在该锁的 field 才表示有人持有；释放到计数为 0 时 Redisson 会 DEL 整个锁 Key。
 
 小 Key (ARGV[2])：格式为  客户端UUID + ":" + 线程ID （例如  88888888-xxxx-1 ）。它唯一标识了是哪台机器、哪个线程加了这把锁。
 
@@ -630,7 +716,11 @@ end;
 ```
 return redis.call('pttl', KEYS[1]); // 返回锁的剩余过期时间（毫秒）
 ```
-如果以上两个条件都不满足，说明这把锁被别人占着。Redisson 框架层接收到这个非空的返回值（剩余时间）后，就会在 Java 端发起  while(true)  自旋或阻塞等待，直到对方释放锁。
+如果以上两个条件都不满足，说明这把锁被别人占着。Redisson 框架层接收到这个非空的返回值（剩余时间）后，可根据是否设置等待时间决定：
+
+- 不等待：立即返回失败；
+
+- 等待：通过 Redis pub/sub 释放消息 + 等待队列/信号量机制等待
 
 ## 锁重试和WatchDog
 ### lock() 方法抢锁流程
@@ -640,8 +730,7 @@ return redis.call('pttl', KEYS[1]); // 返回锁的剩余过期时间（毫秒�
 1. **先判断当前这把锁是否存在**，如果不存在，插入一把锁，返回 null
 2. **判断当前这把锁是否属于当前线程**，如果是，则返回 null
 
-所以如果返回是 null，则代表着当前线程已经抢锁完毕，或者可重入完毕。但是如果以上两个条件都不满足，则进入到第三个条件，返回的是锁的失效时间。同学们可以自行往下翻一点点，你能发现有个 `while(true)` 再次进行 `tryAcquire` 进行抢锁。
-
+所以如果返回是 null，则代表着当前线程已经抢锁完毕，或者可重入完毕。但是如果以上两个条件都不满足，则进入到第三个条件，返回的是锁的失效时间。
 ```java
 long threadId = Thread.currentThread().getId();
 Long ttl = tryAcquire(-1, leaseTime, unit, threadId);
