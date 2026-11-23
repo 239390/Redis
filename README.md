@@ -6,46 +6,6 @@
 # 缓存一致性
 # 分布式锁
 
-# 一、缓存基础
-## 1.缓存层级
-本地缓存:
-- 速度快
-- 数据不共享
-- 内存有限
-  
-分布式缓存:
-- 数据共享
-- 容量大
-- 速度稍慢
-  
-数据库/磁盘: 最终数据源
-
-## 2.引入收益与代价
-收益：
-
-- 提高读取性能，降低数据库压力。
-
-- 应对高并发，提升系统吞吐量。
-
-- 减少网络/磁盘 IO，加快响应速度。
-
-代价：
-
-- 数据一致性：缓存与 DB 可能不一致，需设计更新策略。
-
-- 复杂性：增加缓存穿透、击穿、雪崩等问题。
-
-- 运维成本：需维护缓存集群，监控命中率等。
-## 3.为什么要在DB前面加入缓存?代价是什么？
-原因：DB 是系统的瓶颈（磁盘 IO、连接数有限），缓存（内存）能抗住大部分读请求，保护 DB。
-
-代价：
-
-- 引入一致性问题（缓存脏读、更新丢失）。
-
-- 增加架构复杂度（缓存更新、失效、集群）。
-
-- 可能出现缓存三大问题（穿透、击穿、雪崩）。
 # 二、缓存更新策略
 ## 1.旁路缓存读写流程
 读：
@@ -165,3 +125,166 @@ Redis Cluster 有 16384 个槽（ 0-16383 ）。
 增删节点时，通过槽迁移（ MIGRATE ）平衡负载，无需停机。
 
 客户端根据槽定位节点（ GETSLOT ），或接收重定向（ MOVED  错误）。
+# 主从集群
+## 主从同步原理
+### 1. 核心概念
+- **Replication Id（replid）**：数据集标识。master 有唯一 replid，slave 会继承 master 的 replid；replid 一致表示同一数据集。
+- **offset**：同步偏移量，记录在 `repl_baklog` 中。slave 记录已同步 offset；若小于 master offset，说明数据落后。
+- slave 同步时需向 master 声明自己的 **replid 和 offset**，master 据此判断同步方式。
+
+### 2. 全量同步
+master 生成完整 RDB 发给 slave，后续命令通过 repl_baklog 持续发送。
+**触发场景：**
+- slave 第一次连接 master；
+- slave 断开太久，`repl_baklog` 中对应 offset 已被覆盖。
+
+**判断依据：**
+- slave 发送的 replid 与 master 不一致，说明是全新 slave，需要全量同步。
+
+**流程：**
+1. slave 请求增量同步；
+2. master 判断 replid 不一致，拒绝增量同步；
+3. master 生成完整内存数据的 RDB 并发送给 slave；
+4. slave 清空本地数据并加载 RDB；
+5. master 将 RDB 期间的命令记录到 `repl_baklog`，并持续发送给 slave；
+6. slave 执行命令，保持同步。
+7. master 将自己的 replid 和 offset 发给 slave，slave 保存；此后 replid 与 master 一致。
+
+### 3. 增量同步
+slave 提交 offset，master 只发送 repl_baklog 中 offset 之后的命令。
+- 只同步 slave 与 master 存在差异的部分数据。
+- slave 提交自己的 offset，master 从 `repl_baklog` 中获取该 offset 之后的命令发送给 slave。
+- **触发场景**：slave 断开后恢复，且其 offset 仍能在 `repl_baklog` 中找到。
+
+### 4. repl_baklog 原理
+- 固定大小的环形数组，写满后覆盖最早数据。
+- 记录 Redis 处理过的命令及 offset，包括 master 当前 offset 和 slave 已拷贝 offset。
+- 两者差异即需要增量同步的数据。
+- 若 slave 断开过久，未同步数据被覆盖，无法增量同步，只能全量同步。
+
+### 5. 主从同步优化
+- 配置 `repl-diskless-sync yes`，启用无磁盘复制，减少全量同步磁盘 IO；
+- 控制单节点内存占用，减少 RDB 导致的磁盘 IO；
+- 适当提高 `repl_baklog` 大小，并尽快恢复故障 slave，尽量避免全量同步；
+- 限制单个 master 的 slave 数量；slave 太多时采用 **主-从-从链式结构**，减轻 master 压力。
+
+# 哨兵
+## 作用
+哨兵的作用如下：
+- 状态监控：Sentinel 会不断检查您的master和slave是否按预期工作
+- 故障恢复（failover）：如果master故障，Sentinel会将一个slave提升为master。当故障实例恢复后会成为slave
+- 状态通知：Sentinel充当Redis客户端的服务发现来源，当集群发生failover时，会将最新集群信息推送给Redis的客户端
+## 状态监控
+Sentinel基于心跳机制监测服务状态，每隔1秒向集群的每个节点发送ping命令，并通过实例的响应结果来做出判断：
+- 主观下线（sdown）：如果某sentinel节点发现某Redis节点未在规定时间响应，则认为该节点主观下线。
+- 客观下线(odown)：若超过指定数量（通过quorum设置）的sentinel都认为该节点主观下线，则该节点客观下线。quorum值最好超过Sentinel节点数量的一半，Sentinel节点数量至少3台。
+### 故障处理
+#### 故障转移步骤
+- 首先要在sentinel中选出一个leader，由leader执行failover​
+- 选定一个slave作为新的master，执行slaveof noone，切换到master模式​
+- 然后让所有节点都执行slaveof 新master​
+- 修改故障节点配置，添加slaveof 新master
+
+一旦发现master故障，sentinel需要在salve中选择一个作为新的master，选择依据是这样的：
+- 首先会判断slave节点与master节点断开时间长短，如果超过down-after-milliseconds * 10则会排除该slave节点
+- 然后判断slave节点的slave-priority值，越小优先级越高，如果是0则永不参与选举（默认都是1）。
+- 如果slave-prority一样，则判断slave节点的offset值，越大说明数据越新，优先级越高
+- 最后是判断slave节点的run_id大小，越小优先级越高（通过info server可以查看run_id）。
+
+### 身份切换
+- 在多个sentinel中选举一个leader
+- 由leader执行failover
+## 选举leader
+首先，Sentinel集群要选出一个执行failover的Sentinel节点，可以成为leader。要成为leader要满足三个条件：
+- 最先获得超过半数的投票
+- 获得的投票数不小于quorum值
+- 一般情况下最先发起failover的节点会当选
+而sentinel投票的原则有两条：
+- 优先投票给目前得票最多的
+- 如果目前没有任何节点的票，就投给自己
+
+## failover
+- sentinel给备选的slave1节点发送slaveof no one命令，让该节点成为master
+- sentinel给所有其它slave发送slaveof 192.168.150.101 7002 命令，让这些节点成为新master，也就是7002的slave节点，开始从新的master上同步数据。
+- 最后，当故障节点恢复后会接收到哨兵信号，执行slaveof 192.168.150.101 7002命令，成为slave：
+# 分片集群
+## 集群配置要
+### 1. 集群模式必需参数
+分片集群中的 Redis 节点必须开启集群模式，配置文件中常用参数：
+
+```conf
+port 7000
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 5000
+appendonly yes
+```
+
+关键参数说明：
+- `cluster-enabled yes`：开启集群模式；
+- `cluster-config-file`：集群配置文件名称，无需手动创建，由集群自动维护；
+- `cluster-node-timeout`：节点之间心跳超时时间；
+- `appendonly yes`：开启 AOF 持久化（示例配置中包含）。
+
+### 2. Docker Compose 部署集群
+在 `/root/redis-cluster` 下新建 `docker-compose.yaml`，启动 6 个 Redis 节点：
+- 端口分别为 `7001` ~ `7006`；
+- 每个节点启动参数包含：
+  - `--port`
+  - `--cluster-enabled yes`
+  - `--cluster-config-file node.conf`
+- **必须使用 `network_mode: "host"`**，否则 Docker 部署 Redis 集群会有网络问题。
+
+启动命令：
+
+```bash
+docker-compose up -d
+```
+
+查看进程：
+
+```bash
+ps -ef | grep redis
+```
+
+每个节点应以 `[cluster]` 模式运行，但此时节点之间尚未建立连接。
+
+### 3. 创建集群
+进入任意节点容器：
+
+```bash
+docker exec -it r1 bash
+```
+
+执行创建集群命令：
+
+```bash
+redis-cli --cluster create --cluster-replicas 1 \
+192.168.150.101:7001 192.168.150.101:7002 192.168.150.101:7003 \
+192.168.150.101:7004 192.168.150.101:7005 192.168.150.101:7006
+```
+
+命令说明：
+- `redis-cli --cluster`：集群操作命令；
+- `create`：创建集群；
+- `--cluster-replicas 1`：每个 master 的副本数为 1。
+
+### 4. master/slave 分配规则
+节点总数 ÷ `(replicas + 1)` = master 数量 `n`。
+
+### 5. 查看集群状态
+命令：
+
+```bash
+redis-cli -p 7001 cluster nodes
+```
+
+用于查看集群节点、master/slave 角色及分配关系。
+
+### 6. 核心注意点
+- 集群节点必须开启 `cluster-enabled yes`；
+- Docker 部署必须使用 host 网络模式；
+- `cluster-config-file` 由集群自动维护，无需手动创建；
+- 创建集群时通过 `--cluster-replicas 1` 指定每个 master 的副本数；
+- 前 n 个节点为 master，其余为 slave；
+- 创建前节点只是以 cluster 模式运行，尚未建立连接，需执行 `redis-cli --cluster create` 完成组网。
