@@ -288,3 +288,71 @@ redis-cli -p 7001 cluster nodes
 - 创建集群时通过 `--cluster-replicas 1` 指定每个 master 的副本数；
 - 前 n 个节点为 master，其余为 slave；
 - 创建前节点只是以 cluster 模式运行，尚未建立连接，需执行 `redis-cli --cluster create` 完成组网。
+## 散列插槽
+### 1. 数据分片依据：Hash Slot
+Redis Cluster 采用 **散列插槽（hash slot）** 实现数据分片，而不是一致性 Hash。
+
+- 集群中共有 **16384 个 hash slots**；
+- 每个 master 节点分配一定数量的插槽；
+- 集群创建时即完成插槽分配。
+### 2. Key 到 Slot 的计算
+读写数据时：
+
+1. 使用 **CRC16 算法** 对 key 做 hash 运算；
+2. 将结果与 **16384 取余**；
+3. 得到该 key 对应的 slot；
+4. 到 slot 所属的 Redis 节点执行读写。
+
+### 3. `{}` 对 slot 计算的影响
+Hash slot 计算分两种情况：
+
+- **key 中不包含 `{}`**：根据整个 key 字符串计算 slot；
+- **key 中包含 `{}`**：根据 `{}` 之间的字符串计算 slot。
+
+示例：
+- `user`：根据 `user` 计算 slot；
+- `user:{age}`：根据 `age` 计算 slot；
+- `age`：根据 `age` 计算 slot。
+
+因此 `user:{age}` 和 `age` 会计算出相同的 slot。
+
+### 4. 客户端连接集群需加 `-c`
+直接连接某个节点写入不属于该节点的 key 会报错，例如：
+
+```bash
+redis-cli -p 7001
+set user jack
+```
+
+可能返回 `MOVED 5474`，表示 `user` 的 slot 是 5474，而该 slot 在 7002 节点，不能在 7001 写入。
+
+连接集群时应加 `-c` 参数：
+
+```bash
+redis-cli -c -p 7001
+set user jack
+```
+
+客户端会自动跳转到 slot 所在节点。
+
+## 故障转移
+- 集群节点之间通过 **ping 心跳检测**；
+- 超时未回应的节点会被标记为下线；
+- 当发现 **master 下线** 时，会将其某个 **slave 提升为 master**；
+- 原 master 恢复后可能被标记为 slave，并与新 master 形成主从关系，实现主从地位互换。
+
+示例：
+- 让 7002 休眠后，集群标记其下线；
+- 原本 7002 的 slave 7006 被提升为 master；
+- 7002 恢复后成为 slave，其 master 为 7006。
+
+## 核心结论
+**如何判断某个 key 在哪个实例？**
+1. 16384 个插槽分配到不同实例；
+2. 根据 key 计算哈希值并对 16384 取余；
+3. 余数作为插槽，寻找插槽所在实例。
+
+**如何让同一类数据固定保存在同一 Redis 实例？**
+- 利用 `{}` 计算插槽的规则；
+- 在 key 中加入 `{类型}`，例如统一以 `{typeId}` 为前缀；
+- 这样同类型数据计算出的插槽一定相同，会落到同一实例。
