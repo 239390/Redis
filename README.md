@@ -185,7 +185,7 @@ Sentinel基于心跳机制监测服务状态，每隔1秒向集群的每个节�
 - 然后让所有节点都执行slaveof 新master​
 - 修改故障节点配置，添加slaveof 新master
 
-一旦发现master故障，sentinel需要在salve中选择一个作为新的master，选择依据是这样的：
+#### sentinel从slave中选取master的依据
 - 首先会判断slave节点与master节点断开时间长短，如果超过down-after-milliseconds * 10则会排除该slave节点
 - 然后判断slave节点的slave-priority值，越小优先级越高，如果是0则永不参与选举（默认都是1）。
 - 如果slave-prority一样，则判断slave节点的offset值，越大说明数据越新，优先级越高
@@ -208,7 +208,7 @@ Sentinel基于心跳机制监测服务状态，每隔1秒向集群的每个节�
 - sentinel给所有其它slave发送slaveof 192.168.150.101 7002 命令，让这些节点成为新master，也就是7002的slave节点，开始从新的master上同步数据。
 - 最后，当故障节点恢复后会接收到哨兵信号，执行slaveof 192.168.150.101 7002命令，成为slave：
 # 分片集群
-## 集群配置要
+## 集群配置
 ### 1. 集群模式必需参数
 分片集群中的 Redis 节点必须开启集群模式，配置文件中常用参数：
 
